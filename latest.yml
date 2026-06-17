@@ -1,0 +1,192 @@
+---
+- name: Install or update packages
+  ansible.builtin.dnf:
+    name:
+      - iproute-tc
+      - dnf-utils
+    state: latest
+
+- name: Disable swap immediately
+  command: swapoff -a
+  when: ansible_swaptotal_mb > 0
+
+- name: Comment out swap entries in /etc/fstab
+  replace:
+    path: /etc/fstab
+    regexp: '^([^#].*\sswap\s+.*)$'
+    replace: '# \1'
+  register: swap_disable
+
+#- name: Show if fstab was modified
+#  debug:
+#    msg: "Swap entries were disabled in /etc/fstab"
+#    when: swap_fstab.changed
+
+- name: Set SELinux to permissive immediately
+  command: setenforce 0
+  when: ansible_selinux.status == "enabled" and ansible_selinux.mode != "permissive"
+
+- name: Persist SELinux setting in config file
+  lineinfile:
+    path: /etc/selinux/config
+    regexp: '^SELINUX='
+    line: 'SELINUX=permissive'
+
+- name: Ensure firewalld is installed and running
+  service:
+    name: firewalld
+    state: started
+    enabled: true
+
+- name: Add Kubernetes ports to firewalld
+  command: >
+    firewall-cmd --permanent --add-port={{ item }}
+  loop:
+    - 6443/tcp
+    - 2379-2380/tcp
+    - 10250/tcp
+    - 10257/tcp
+    - 10259/tcp
+    - 30000-32767/tcp
+
+- name: Reload firewalld
+  command: firewall-cmd --reload
+
+- name: Load required kernel modules
+  become: true
+  command: modprobe {{ item }}
+  loop:
+    - overlay
+    - br_netfilter
+
+- name: Ensure overlay module is loaded on boot
+  copy:
+    dest: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+
+- name: Configure sysctl values
+  lineinfile:
+    path: /etc/sysctl.d/k8s.conf
+    line: "{{ item }}"
+    create: true
+  loop:
+    - net.bridge.bridge-nf-call-iptables = 1
+    - net.ipv4.ip_forward = 1
+    - net.bridge.bridge-nf-call-ip6tables = 1
+
+- name: Apply sysctl settings
+  command: sysctl --system
+
+- name: Add Docker repository file
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/centos/docker-ce.repo
+    dest: /etc/yum.repos.d/docker-ce.repo
+    mode: '0644'
+
+- name: Refresh package cache
+  dnf:
+    update_cache: true
+
+- name: Remove podman and runc
+  dnf:
+    name:
+      - podman
+      - runc
+    state: absent
+
+- name: Install containerd.io
+  dnf:
+    name: containerd.io
+    state: present
+
+- name: Enable and start containerd
+  service:
+    name: containerd
+    enabled: true
+    state: started
+
+- name: Generate default containerd configuration
+  ansible.builtin.shell: |
+    containerd config default
+  register: containerd_default
+  changed_when: false
+
+- name: Write containerd configuration
+  ansible.builtin.copy:
+    content: "{{ containerd_default.stdout }}"
+    dest: /etc/containerd/config.toml
+    owner: root
+    group: root
+    mode: '0644'
+    backup: true
+
+- name: Set SystemdCgroup to true
+  replace:
+    path: /etc/containerd/config.toml
+    regexp: '^\s*SystemdCgroup\s*=\s*false'
+    replace: '            SystemdCgroup = true'
+  notify: Restart containerd
+
+- name: Create Kubernetes repository
+  copy:
+    dest: /etc/yum.repos.d/kubernetes.repo
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [kubernetes]
+      name=Kubernetes
+      baseurl=https://pkgs.k8s.io/core:/stable:/v1.28/rpm/
+      enabled=1
+      gpgcheck=1
+      gpgkey=https://pkgs.k8s.io/core:/stable:/v1.28/rpm/repodata/repomd.xml.key
+      exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+
+- name: Refresh DNF metadata cache
+  dnf:
+    update_cache: true
+
+#- name: List configured repositories
+#  command:
+#    cmd: dnf repolist
+#    register: dnf_repolist
+#    changed_when: false
+
+- name: Install Kubernetes packages
+  dnf:
+    name:
+      - kubelet
+      - kubeadm
+      - kubectl
+    state: present
+    disable_excludes: kubernetes
+
+- name: Enable and start kubelet
+  service:
+    name: kubelet
+    enabled: true
+    state: started
+
+- name: Ensure /opt/bin exists
+  file:
+    path: /opt/bin
+    state: directory
+    mode: '0755'
+
+- name: Download flanneld binary
+  ansible.builtin.get_url:
+    url: https://github.com/flannel-io/flannel/releases/download/v0.19.0/flanneld-amd64
+    dest: /opt/bin/flanneld
+    mode: '0755'
+
+- name: Pull Kubernetes images
+  ansible.builtin.command: kubeadm config images pull
+  register: kubeadm_pull
+  changed_when: false
+  become: true
+
+- name: Show output
+  ansible.builtin.debug:
+    var: kubeadm_pull.stdout_lines
