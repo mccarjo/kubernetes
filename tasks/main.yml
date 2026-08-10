@@ -4,8 +4,6 @@
   service:
     name: containerd
     state: restarted
-[root@ansible-master handlers]# cd ../tasks/
-[root@ansible-master tasks]# cat main.yml
 ---
 - name: Install or update packages
   ansible.builtin.dnf:
